@@ -49,60 +49,92 @@ app.post('/api/zalo/create-qr', async (req, res) => {
     const zalo = new Zalo();
     sessions[sessionId] = { zalo, status: 'pending', displayName };
 
-    // Lắng nghe sự kiện QR
-    zalo.onLoginQR(async (event) => {
-      if (event.type === LoginQRCallbackEventType.QRUpdated) {
-        // Tạo QR image từ URL
-        const qrDataURL = await QRCode.toDataURL(event.data.qrUrl, {
-          width: 280,
-          margin: 2,
-          color: { dark: '#0068FF', light: '#FFFFFF' }
-        });
+    // Trả về ngay để frontend không bị timeout
+    res.json({ success: true, sessionId, message: 'QR đang được tạo...' });
 
-        broadcast(sessionId, {
-          type: 'qr',
-          qrDataURL,
-          qrUrl: event.data.qrUrl,
-          expiry: event.data.expiry || 60
-        });
+    // Bắt đầu login QR — callback nhận từng sự kiện
+    try {
+      const api = await zalo.loginQR({}, async (event) => {
+        console.log(`[QR] Session ${sessionId} event:`, event.type, LoginQRCallbackEventType[event.type]);
 
-        console.log(`[QR] Session ${sessionId}: QR updated`);
-      }
-    });
+        // QR mới được tạo hoặc cập nhật
+        if (event.type === LoginQRCallbackEventType.QRCodeGenerated) {
+          const qrUrl = event.data?.url || event.data?.qrUrl || event.data;
+          console.log(`[QR] URL:`, qrUrl);
 
-    // Bắt đầu login
-    const loginResult = await zalo.login({
-      qr: true,
-      onSuccess: (info) => {
-        sessions[sessionId].status  = 'connected';
-        sessions[sessionId].info    = info;
-        sessions[sessionId].phone   = info.profile?.phoneNumber;
-        sessions[sessionId].name    = info.profile?.displayName || displayName;
+          if (qrUrl) {
+            try {
+              const qrDataURL = await QRCode.toDataURL(String(qrUrl), {
+                width: 280,
+                margin: 2,
+                color: { dark: '#0068FF', light: '#FFFFFF' }
+              });
+              broadcast(sessionId, {
+                type: 'qr',
+                qrDataURL,
+                qrUrl: String(qrUrl),
+                expiry: 60
+              });
+              console.log(`[QR] ✅ Broadcast QR to session ${sessionId}`);
+            } catch(qrErr) {
+              console.error('[QR] QRCode.toDataURL error:', qrErr.message);
+            }
+          }
+        }
 
-        // Lưu bot
-        const phone = info.profile?.phoneNumber;
+        // QR hết hạn
+        if (event.type === LoginQRCallbackEventType.QRCodeExpired) {
+          broadcast(sessionId, { type: 'qr_expired', message: 'QR hết hạn, đang tạo mới...' });
+        }
+
+        // Đã quét QR
+        if (event.type === LoginQRCallbackEventType.QRCodeScanned) {
+          broadcast(sessionId, { type: 'qr_scanned', message: 'Đã quét QR, đang xác nhận...' });
+        }
+
+        // Đăng nhập thành công — GotLoginInfo
+        if (event.type === LoginQRCallbackEventType.GotLoginInfo) {
+          const info = event.data;
+          sessions[sessionId].status = 'connected';
+          sessions[sessionId].info   = info;
+
+          // Lấy profile từ api (loginQR trả về api object sau khi resolve)
+          broadcast(sessionId, {
+            type: 'login_success',
+            phone: null,
+            name:  displayName,
+            message: 'Đăng nhập thành công!'
+          });
+          console.log(`[Login] ✅ Session ${sessionId}: login thành công`);
+        }
+      });
+
+      // loginQR resolve = đăng nhập xong, api là Zalo API instance
+      if (api) {
+        sessions[sessionId].api    = api;
+        sessions[sessionId].status = 'connected';
+        const profile = await api.fetchAccountInfo().catch(() => null);
+        const phone   = profile?.profile?.phoneNumber;
+        const name    = profile?.profile?.displayName || displayName;
+
         if (phone) {
-          bots[phone] = { zalo, name: info.profile?.displayName, sessionId };
-          setupMessageListener(phone, zalo);
+          bots[phone] = { zalo: api, name, sessionId };
+          setupMessageListener(phone, api);
         }
 
         broadcast(sessionId, {
           type: 'login_success',
-          phone: info.profile?.phoneNumber,
-          name:  info.profile?.displayName,
-          avatar: info.profile?.avatar
+          phone,
+          name,
+          avatar: profile?.profile?.avatar
         });
-
-        console.log(`[Login] ✅ Session ${sessionId}: ${info.profile?.displayName} (${info.profile?.phoneNumber})`);
-      },
-      onFailed: (err) => {
-        sessions[sessionId].status = 'failed';
-        broadcast(sessionId, { type: 'login_failed', message: err?.message || 'Đăng nhập thất bại' });
-        console.warn(`[Login] ❌ Session ${sessionId}:`, err?.message);
+        console.log(`[Login] ✅ Profile: ${name} (${phone})`);
       }
-    });
-
-    res.json({ success: true, sessionId, message: 'QR đang được tạo...' });
+    } catch(loginErr) {
+      sessions[sessionId].status = 'failed';
+      broadcast(sessionId, { type: 'login_failed', message: loginErr.message });
+      console.error('[login]', loginErr.message);
+    }
 
   } catch (err) {
     console.error('[create-qr]', err);
@@ -173,9 +205,12 @@ app.post('/api/zalo/send', async (req, res) => {
 });
 
 // ── Lắng nghe tin nhắn đến ────────────────────────────────────
-function setupMessageListener(phone, zalo) {
+function setupMessageListener(phone, api) {
   try {
-    zalo.api.listener.on('message', async (msg) => {
+    // api là instance trả về từ loginQR (đã có listener)
+    const listener = api.listener || (api.api && api.api.listener);
+    if (!listener) { console.warn('[Listener] Không tìm thấy listener cho', phone); return; }
+    listener.on('message', async (msg) => {
       if (msg.isSelf) return; // Bỏ qua tin tự gửi
 
       const fromPhone  = msg.fromUid;
@@ -190,10 +225,11 @@ function setupMessageListener(phone, zalo) {
 
       if (replyText) {
         try {
+          const sendApi = api.sendMessage ? api : (api.api || api);
           if (threadType === 2) {
-            await zalo.api.sendMessage({ msg: replyText }, threadId, 2);
+            await sendApi.sendMessage({ msg: replyText }, threadId, 2);
           } else {
-            await zalo.api.sendMessage({ msg: replyText }, fromPhone, 0);
+            await sendApi.sendMessage({ msg: replyText }, fromPhone, 0);
           }
         } catch(e) {
           console.error('[reply]', e.message);
@@ -214,8 +250,8 @@ function setupMessageListener(phone, zalo) {
       }
     });
 
-    zalo.api.listener.start();
-    console.log(`[Listener] Started for bot ${phone}`);
+    listener.start();
+    console.log(`[Listener] ✅ Started for bot ${phone}`);
   } catch(e) {
     console.warn('[setupMessageListener]', e.message);
   }
