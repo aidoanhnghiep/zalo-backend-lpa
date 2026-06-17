@@ -216,6 +216,18 @@ function setupMessageListener(phone, api) {
 
       console.log(`[Msg] Bot ${phone} ← ${fromPhone}: ${content}`);
 
+      // Lấy tên người dùng từ Zalo API
+      let fromName = fromPhone;
+      let fromAvatar = '';
+      try {
+        const sendApi = api.sendMessage ? api : (api.api || api);
+        const userInfo = await sendApi.getUserInfo({ userId: fromPhone }).catch(() => null);
+        if (userInfo?.profile) {
+          fromName   = userInfo.profile.displayName || fromPhone;
+          fromAvatar = userInfo.profile.avatar       || '';
+        }
+      } catch(e) { /* Không lấy được tên — dùng UID */ }
+
       // Gọi AI để xử lý (nếu cấu hình)
       let replyText = await processMessage(phone, fromPhone, content, threadId, threadType);
 
@@ -238,6 +250,8 @@ function setupMessageListener(phone, api) {
         broadcast(bot.sessionId, {
           type:       'new_message',
           from:       fromPhone,
+          fromName,
+          fromAvatar,
           content,
           threadId,
           threadType,
