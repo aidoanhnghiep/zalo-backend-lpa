@@ -57,28 +57,24 @@ app.post('/api/zalo/create-qr', async (req, res) => {
       const api = await zalo.loginQR({}, async (event) => {
         console.log(`[QR] Session ${sessionId} event:`, event.type, LoginQRCallbackEventType[event.type]);
 
-        // QR mới được tạo hoặc cập nhật
+        // QR mới được tạo
+        // event.data.image = base64 PNG (KHÔNG có prefix data:image/png;base64,)
         if (event.type === LoginQRCallbackEventType.QRCodeGenerated) {
-          const qrUrl = event.data?.url || event.data?.qrUrl || event.data;
-          console.log(`[QR] URL:`, qrUrl);
+          console.log(`[QR] data keys:`, Object.keys(event.data || {}));
 
-          if (qrUrl) {
-            try {
-              const qrDataURL = await QRCode.toDataURL(String(qrUrl), {
-                width: 280,
-                margin: 2,
-                color: { dark: '#0068FF', light: '#FFFFFF' }
-              });
-              broadcast(sessionId, {
-                type: 'qr',
-                qrDataURL,
-                qrUrl: String(qrUrl),
-                expiry: 60
-              });
-              console.log(`[QR] ✅ Broadcast QR to session ${sessionId}`);
-            } catch(qrErr) {
-              console.error('[QR] QRCode.toDataURL error:', qrErr.message);
-            }
+          const imgBase64 = event.data?.image;
+          if (imgBase64) {
+            // Thêm prefix để thành data URL hợp lệ
+            const qrDataURL = 'data:image/png;base64,' + imgBase64;
+            broadcast(sessionId, {
+              type: 'qr',
+              qrDataURL,
+              qrUrl: null,  // zca-js không trả về URL riêng
+              expiry: 60
+            });
+            console.log(`[QR] ✅ Broadcast QR image (base64 PNG) to session ${sessionId}`);
+          } else {
+            console.warn('[QR] event.data.image không có:', event.data);
           }
         }
 
