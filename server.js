@@ -1,332 +1,310 @@
-/**
- * ZALO BACKEND — AI Platform Long Phúc A
- * Xử lý đăng nhập Zalo cá nhân qua QR + webhook chatbot
- * 
- * Deploy: Node.js server (port 3001)
- * Cài đặt: npm install
- * Chạy: node server.js
- */
-
-const express = require('express');
-const cors    = require('cors');
-const http    = require('http');
+// ============================================================
+// SERVER.JS v4 — Long Phúc A — HOÀN CHỈNH
+// Zalo cá nhân QR + AI Gemini auto-reply + Quản lý tin nhắn
+// ============================================================
+require('dotenv').config();
+const express   = require('express');
+const http      = require('http');
 const WebSocket = require('ws');
-const QRCode  = require('qrcode');
-const { Zalo, LoginQRCallbackEventType } = require('zca-js');
-
+const cors      = require('cors');
 const app    = express();
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server });
-
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ── State ──────────────────────────────────────────────────────
-const sessions = {};   // { sessionId: { zalo, status, info, listeners } }
-const bots     = {};   // { phoneNumber: { zalo, name, listeners } }
+const PORT         = process.env.PORT || 3001;
+const GEMINI_KEY   = process.env.GEMINI_API_KEY || '';
+let   RUNTIME_KEY  = GEMINI_KEY; // có thể update từ frontend
 
-// ── WebSocket broadcast ────────────────────────────────────────
-function broadcast(sessionId, data) {
-  const msg = JSON.stringify(data);
-  wss.clients.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN && ws.sessionId === sessionId) {
-      ws.send(msg);
-    }
-  });
+// ── State ────────────────────────────────────────────────────
+const wsClients = new Set();
+const sessions  = new Map(); // sid → {ws, zalo}
+const history   = new Map(); // uid → [{role,parts}]
+const contacts  = new Map(); // uid → {name,avatar,phone,msgs[]}
+
+function getHist(uid){ return history.get(uid)||[]; }
+function addHist(uid,role,text){
+  const h=getHist(uid);
+  h.push({role,parts:[{text}]});
+  if(h.length>20) h.splice(0,h.length-20);
+  history.set(uid,h);
+}
+function getContact(uid,name,avatar){
+  if(!contacts.has(uid)) contacts.set(uid,{name:name||uid,avatar:avatar||'',phone:uid,msgs:[],unread:0,lastTime:Date.now()});
+  const c=contacts.get(uid);
+  if(name && name!==uid) c.name=name;
+  if(avatar) c.avatar=avatar;
+  return c;
 }
 
-wss.on('connection', (ws, req) => {
-  const url = new URL(req.url, 'http://localhost');
-  ws.sessionId = url.searchParams.get('sid') || 'default';
-  ws.send(JSON.stringify({ type: 'connected', sid: ws.sessionId }));
-});
+// ── Broadcast ────────────────────────────────────────────────
+function broadcast(data){
+  const m=JSON.stringify(data);
+  wsClients.forEach(ws=>{ if(ws.readyState===WebSocket.OPEN) ws.send(m); });
+}
 
-// ── API: Tạo QR đăng nhập Zalo cá nhân ────────────────────────
-app.post('/api/zalo/create-qr', async (req, res) => {
-  const { sessionId = 'default', displayName = 'Zalo Bot' } = req.body;
-
-  try {
-    const zalo = new Zalo();
-    sessions[sessionId] = { zalo, status: 'pending', displayName };
-
-    // Trả về ngay để frontend không bị timeout
-    res.json({ success: true, sessionId, message: 'QR đang được tạo...' });
-
-    // Bắt đầu login QR — callback nhận từng sự kiện
-    try {
-      const api = await zalo.loginQR({}, async (event) => {
-        console.log(`[QR] Session ${sessionId} event:`, event.type, LoginQRCallbackEventType[event.type]);
-
-        // QR mới được tạo
-        // event.data.image = base64 PNG (KHÔNG có prefix data:image/png;base64,)
-        if (event.type === LoginQRCallbackEventType.QRCodeGenerated) {
-          console.log(`[QR] data keys:`, Object.keys(event.data || {}));
-
-          const imgBase64 = event.data?.image;
-          if (imgBase64) {
-            // Thêm prefix để thành data URL hợp lệ
-            const qrDataURL = 'data:image/png;base64,' + imgBase64;
-            broadcast(sessionId, {
-              type: 'qr',
-              qrDataURL,
-              qrUrl: null,  // zca-js không trả về URL riêng
-              expiry: 60
-            });
-            console.log(`[QR] ✅ Broadcast QR image (base64 PNG) to session ${sessionId}`);
-          } else {
-            console.warn('[QR] event.data.image không có:', event.data);
-          }
-        }
-
-        // QR hết hạn
-        if (event.type === LoginQRCallbackEventType.QRCodeExpired) {
-          broadcast(sessionId, { type: 'qr_expired', message: 'QR hết hạn, đang tạo mới...' });
-        }
-
-        // Đã quét QR
-        if (event.type === LoginQRCallbackEventType.QRCodeScanned) {
-          broadcast(sessionId, { type: 'qr_scanned', message: 'Đã quét QR, đang xác nhận...' });
-        }
-
-        // Đăng nhập thành công — GotLoginInfo
-        if (event.type === LoginQRCallbackEventType.GotLoginInfo) {
-          const info = event.data;
-          sessions[sessionId].status = 'connected';
-          sessions[sessionId].info   = info;
-
-          // Lấy profile từ api (loginQR trả về api object sau khi resolve)
-          broadcast(sessionId, {
-            type: 'login_success',
-            phone: null,
-            name:  displayName,
-            message: 'Đăng nhập thành công!'
-          });
-          console.log(`[Login] ✅ Session ${sessionId}: login thành công`);
-        }
-      });
-
-      // loginQR resolve = đăng nhập xong, api là Zalo API instance
-      if (api) {
-        sessions[sessionId].api    = api;
-        sessions[sessionId].status = 'connected';
-        const profile = await api.fetchAccountInfo().catch(() => null);
-        const phone   = profile?.profile?.phoneNumber;
-        const name    = profile?.profile?.displayName || displayName;
-
-        if (phone) {
-          bots[phone] = { zalo: api, name, sessionId };
-          setupMessageListener(phone, api);
-        }
-
-        broadcast(sessionId, {
-          type: 'login_success',
-          phone,
-          name,
-          avatar: profile?.profile?.avatar
-        });
-        console.log(`[Login] ✅ Profile: ${name} (${phone})`);
+// ── Gemini AI ─────────────────────────────────────────────────
+async function askGemini(text,uid,sysPrompt){
+  const key=RUNTIME_KEY;
+  if(!key) return 'Xin lỗi, AI chưa được cấu hình. Hotline: 0915 40 5969 ạ!';
+  const {default:fetch}=await import('node-fetch');
+  addHist(uid,'user',text);
+  try{
+    const r=await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`,
+      { method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          contents: getHist(uid),
+          systemInstruction:{parts:[{text: sysPrompt||
+            'Bạn là trợ lý AI của Long Phúc A Technology (LPA Computer).\n'+
+            'Hotline: 0915 40 5969. Web: web3aai.com\n'+
+            'Chuyên: Chatbot AI, chuyển đổi số, IT, camera, mạng, máy tính.\n'+
+            'Trả lời ngắn gọn dưới 150 từ, thân thiện, xưng em, gọi anh/chị.\n'+
+            'Nếu cần hỗ trợ sâu hơn: mời gọi hotline 0915 40 5969.'
+          }]}
+        })
       }
-    } catch(loginErr) {
-      sessions[sessionId].status = 'failed';
-      broadcast(sessionId, { type: 'login_failed', message: loginErr.message });
-      console.error('[login]', loginErr.message);
-    }
-
-  } catch (err) {
-    console.error('[create-qr]', err);
-    res.json({ success: false, message: err.message });
+    );
+    const d=await r.json();
+    const reply=d.candidates?.[0]?.content?.parts?.[0]?.text||'Em chưa hiểu. Anh/chị nói rõ hơn được không ạ?';
+    addHist(uid,'model',reply);
+    return reply;
+  }catch(e){
+    console.error('[Gemini]',e.message);
+    return 'Hệ thống đang bận. Vui lòng thử lại sau ạ!';
   }
-});
+}
 
-// ── API: Kiểm tra trạng thái session ──────────────────────────
-app.get('/api/zalo/status/:sessionId', (req, res) => {
-  const s = sessions[req.params.sessionId];
-  if (!s) return res.json({ status: 'not_found' });
-  res.json({
-    status: s.status,
-    phone:  s.phone,
-    name:   s.name,
-    displayName: s.displayName
+// ── zca-js ───────────────────────────────────────────────────
+let ZaloClass=null;
+(async()=>{
+  try{
+    const m=await import('zca-js');
+    ZaloClass=m.Zalo||m.default?.Zalo||m.default;
+    console.log('[ZCA] loaded ✅');
+  }catch(e){ console.warn('[ZCA] not found:',e.message); }
+})();
+
+// ── WebSocket — parse sid từ URL query ───────────────────────
+wss.on('connection',(ws,req)=>{
+  // Parse ?sid=xxx từ URL
+  let sid=null;
+  try{
+    const u=new URL(req.url,'http://x');
+    sid=u.searchParams.get('sid');
+  }catch(e){}
+
+  wsClients.add(ws);
+  if(sid){
+    if(!sessions.has(sid)) sessions.set(sid,{ws});
+    else sessions.get(sid).ws=ws;
+    ws._sid=sid;
+    console.log('[WS] connected, sid:',sid,'total:',wsClients.size);
+  } else {
+    console.log('[WS] connected (no sid), total:',wsClients.size);
+  }
+
+  ws.on('message',async raw=>{
+    try{
+      const m=JSON.parse(raw.toString());
+      if(m.type==='ping'){ ws.send(JSON.stringify({type:'pong'})); return; }
+      if(m.type==='register_session'){
+        const s=m.sessionId;
+        if(!sessions.has(s)) sessions.set(s,{ws});
+        else sessions.get(s).ws=ws;
+        ws._sid=s;
+        console.log('[WS] register_session:',s);
+      }
+      // Nhân viên gửi tin nhắn thủ công
+      if(m.type==='send_message' && m.to && m.text){
+        const sess=sessions.get(ws._sid);
+        if(sess?.zalo){
+          await sess.zalo.sendMessage({to:m.to,text:m.text});
+          console.log('[WS] manual send to',m.to);
+        }
+      }
+    }catch(_){}
   });
-});
 
-// ── API: Liệt kê tất cả bot đang kết nối ─────────────────────
-app.get('/api/zalo/bots', (req, res) => {
-  const list = Object.entries(bots).map(([phone, b]) => ({
-    phone, name: b.name, sessionId: b.sessionId, active: true
-  }));
-  res.json({ success: true, bots: list });
-});
-
-// ── API: Ngắt kết nối bot ─────────────────────────────────────
-app.post('/api/zalo/disconnect', (req, res) => {
-  const { phone, sessionId } = req.body;
-  const key = phone || sessionId;
-
-  if (phone && bots[phone]) {
-    try { bots[phone].zalo?.logout?.(); } catch(e) {}
-    delete bots[phone];
-  }
-
-  if (sessionId && sessions[sessionId]) {
-    sessions[sessionId].status = 'disconnected';
-    delete sessions[sessionId];
-  }
-
-  res.json({ success: true, message: 'Đã ngắt kết nối' });
-});
-
-// ── API: Gửi tin nhắn qua Zalo cá nhân ───────────────────────
-app.post('/api/zalo/send', async (req, res) => {
-  const { phone, toPhone, toThread, message, type = 'user' } = req.body;
-
-  const bot = bots[phone];
-  if (!bot) return res.json({ success: false, message: 'Bot không tồn tại hoặc chưa kết nối' });
-
-  try {
-    const zalo = bot.zalo;
-    const api  = zalo.api;
-
-    if (type === 'group') {
-      await api.sendMessage({ msg: message }, toThread, 2); // ThreadType.Group = 2
-    } else {
-      await api.sendMessage({ msg: message }, toPhone, 0); // ThreadType.User = 0
+  ws.on('close',()=>{
+    wsClients.delete(ws);
+    if(ws._sid){
+      const sess=sessions.get(ws._sid);
+      if(sess && sess.ws===ws) { sess.ws=null; } // giữ session nhưng xóa ws
     }
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[send]', err);
-    res.json({ success: false, message: err.message });
-  }
+    console.log('[WS] disconnected, total:',wsClients.size);
+  });
+  ws.on('error',e=>console.warn('[WS err]',e.message));
 });
 
-// ── Lắng nghe tin nhắn đến ────────────────────────────────────
-function setupMessageListener(phone, api) {
-  try {
-    // api là instance trả về từ loginQR (đã có listener)
-    const listener = api.listener || (api.api && api.api.listener);
-    if (!listener) { console.warn('[Listener] Không tìm thấy listener cho', phone); return; }
-    listener.on('message', async (msg) => {
-      if (msg.isSelf) return; // Bỏ qua tin tự gửi
+// ── API: Tạo QR đăng nhập Zalo ───────────────────────────────
+app.post('/api/zalo/create-qr',async(req,res)=>{
+  const{sessionId,displayName}=req.body||{};
+  res.json({ok:true,sessionId});
 
-      const fromPhone  = msg.fromUid;
-      const content    = msg.data?.content || msg.data?.msg || '';
-      const threadType = msg.threadType; // 0=user, 2=group
-      const threadId   = msg.threadId;
+  const sendTo=(data)=>{
+    const sess=sessions.get(sessionId);
+    const ws=sess?.ws;
+    if(ws?.readyState===WebSocket.OPEN) ws.send(JSON.stringify(data));
+    else { // thử tìm ws khác có cùng sid
+      wsClients.forEach(c=>{ if(c._sid===sessionId && c.readyState===WebSocket.OPEN) c.send(JSON.stringify(data)); });
+    }
+  };
 
-      console.log(`[Msg] Bot ${phone} ← ${fromPhone}: ${content}`);
+  if(!ZaloClass){ sendTo({type:'error',message:'zca-js chưa cài. Chạy: npm install zca-js'}); return; }
 
-      // Lấy tên người dùng từ Zalo API
-      let fromName = fromPhone;
-      let fromAvatar = '';
-      try {
-        const sendApi = api.sendMessage ? api : (api.api || api);
-        const userInfo = await sendApi.getUserInfo({ userId: fromPhone }).catch(() => null);
-        if (userInfo?.profile) {
-          fromName   = userInfo.profile.displayName || fromPhone;
-          fromAvatar = userInfo.profile.avatar       || '';
-        }
-      } catch(e) { /* Không lấy được tên — dùng UID */ }
+  try{
+    const zalo=new ZaloClass();
+    const stream=await zalo.login({loginType:'qr'});
+    if(!stream){ sendTo({type:'error',message:'login() không trả về stream'}); return; }
 
-      // Gọi AI để xử lý (nếu cấu hình)
-      let replyText = await processMessage(phone, fromPhone, content, threadId, threadType);
-
-      if (replyText) {
-        try {
-          const sendApi = api.sendMessage ? api : (api.api || api);
-          if (threadType === 2) {
-            await sendApi.sendMessage({ msg: replyText }, threadId, 2);
-          } else {
-            await sendApi.sendMessage({ msg: replyText }, fromPhone, 0);
-          }
-        } catch(e) {
-          console.error('[reply]', e.message);
-        }
-      }
-
-      // Broadcast đến platform dashboard
-      const bot = bots[phone];
-      if (bot) {
-        broadcast(bot.sessionId, {
-          type:       'new_message',
-          from:       fromPhone,
-          fromName,
-          fromAvatar,
-          content,
-          threadId,
-          threadType,
-          timestamp:  Date.now()
-        });
-      }
+    stream.on('qr',qr=>{
+      console.log('[ZCA] QR ready, sending to session:',sessionId);
+      sendTo({type:'qr',qrDataURL:qr,expiry:60});
     });
 
-    listener.start();
-    console.log(`[Listener] ✅ Started for bot ${phone}`);
-  } catch(e) {
-    console.warn('[setupMessageListener]', e.message);
+    stream.on('login',async cred=>{
+      const name=cred?.name||displayName||'Zalo cá nhân';
+      const phone=cred?.phone||'';
+      console.log('[ZCA] ✅ Login OK:',name,phone);
+      sendTo({type:'login_success',name,phone});
+
+      // Lưu zalo instance vào session
+      if(!sessions.has(sessionId)) sessions.set(sessionId,{ws:null});
+      sessions.get(sessionId).zalo=zalo;
+
+      // Lấy danh sách hội thoại và broadcast
+      setTimeout(async()=>{
+        try{
+          const convList=await zalo.getConversations?.({count:20})||[];
+          if(convList.length){
+            broadcast({type:'zalo_conversations',data:convList});
+            console.log('[ZCA] Synced',convList.length,'conversations');
+          }
+        }catch(e){ console.warn('[ZCA] getConversations:',e.message); }
+      },2000);
+
+      // ── Lắng nghe tin nhắn thật ──
+      zalo.on('message',async msg=>{
+        try{
+          if(msg.isSelf) return;
+          const fromId  =msg.uidFrom||msg.fromId||msg.from||'';
+          const fromName=msg.dName||msg.fromName||'Khách';
+          const avatar  =msg.srcAvt||msg.avatar||'';
+          const content =msg.data?.content||msg.content||msg.text||'';
+          const ts      =Number(msg.ts||msg.time||Date.now());
+          if(!content||!fromId) return;
+
+          console.log(`[ZCA msg] ${fromName}(${fromId}): ${content.slice(0,50)}`);
+
+          // Lưu vào contacts
+          const contact=getContact(fromId,fromName,avatar);
+          contact.unread++;
+          contact.lastTime=ts;
+          if(!contact.msgs) contact.msgs=[];
+          contact.msgs.push({from:'cust',t:content,time:new Date(ts).toLocaleTimeString('vi',{hour:'2-digit',minute:'2-digit'})});
+
+          // Broadcast tới tất cả frontend
+          broadcast({
+            type:'new_message', platform:'zalo',
+            from:fromId, fromName, fromAvatar:avatar,
+            content, timestamp:ts,
+            isGroup:!!msg.isGroup, groupId:msg.idTo||''
+          });
+
+          // Gemini AI tự động trả lời
+          const key=RUNTIME_KEY;
+          if(key){
+            const reply=await askGemini(content,fromId);
+            try{
+              const toId=msg.isGroup?msg.idTo:fromId;
+              await zalo.sendMessage({to:toId,text:reply});
+              console.log(`[ZCA reply] → ${fromName}: ${reply.slice(0,60)}`);
+            }catch(se){ console.error('[ZCA send]',se.message); }
+            // Lưu reply vào contacts
+            contact.msgs.push({from:'bot',t:reply,time:new Date().toLocaleTimeString('vi',{hour:'2-digit',minute:'2-digit'})});
+            broadcast({type:'bot_reply',platform:'zalo',to:fromId,toName:fromName,content:reply,timestamp:Date.now()});
+          }
+        }catch(me){ console.error('[msg handler]',me.message); }
+      });
+    });
+
+    stream.on('error',e=>{
+      console.error('[ZCA stream error]',e.message);
+      sendTo({type:'login_failed',message:e.message});
+    });
+
+  }catch(e){
+    console.error('[create-qr]',e.message);
+    const sess=sessions.get(sessionId);
+    const ws2=sess?.ws;
+    if(ws2?.readyState===WebSocket.OPEN) ws2.send(JSON.stringify({type:'login_failed',message:e.message}));
   }
-}
-
-// ── Xử lý tin nhắn bằng AI ────────────────────────────────────
-const companyPrompts = {}; // { phone: { prompt, apiKey, greeting } }
-
-app.post('/api/zalo/configure', (req, res) => {
-  const { phone, prompt, apiKey, greeting, autoReply = true } = req.body;
-  companyPrompts[phone] = { prompt, apiKey, greeting, autoReply };
-  res.json({ success: true });
 });
 
-async function processMessage(botPhone, fromPhone, content, threadId, threadType) {
-  const config = companyPrompts[botPhone];
-  if (!config || !config.autoReply) return null;
+// ── API: Lấy danh sách contacts/conversations ────────────────
+app.get('/api/zalo/contacts',(req,res)=>{
+  const list=Array.from(contacts.entries()).map(([uid,c])=>({uid,...c,msgs:undefined}));
+  res.json({ok:true,data:list.sort((a,b)=>b.lastTime-a.lastTime)});
+});
 
-  // Nếu có API key → gọi AI
-  if (config.apiKey) {
-    try {
-      const fetch = (await import('node-fetch')).default;
-      const resp = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': config.apiKey,
-          'anthropic-version': '2023-06-01'
-        },
-        body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 500,
-          system: config.prompt || 'Bạn là trợ lý AI hỗ trợ khách hàng. Trả lời ngắn gọn, thân thiện bằng tiếng Việt.',
-          messages: [{ role: 'user', content }]
-        })
-      });
-      const data = await resp.json();
-      return data.content?.[0]?.text || null;
-    } catch(e) {
-      console.warn('[AI]', e.message);
-    }
+// ── API: Lấy tin nhắn của 1 contact ─────────────────────────
+app.get('/api/zalo/messages/:uid',(req,res)=>{
+  const c=contacts.get(req.params.uid);
+  if(!c){ res.json({ok:false,data:[]}); return; }
+  c.unread=0;
+  res.json({ok:true,data:c.msgs||[]});
+});
+
+// ── API: Gửi tin nhắn thủ công ──────────────────────────────
+app.post('/api/zalo/send',async(req,res)=>{
+  const{sessionId,to,text}=req.body||{};
+  const sess=sessions.get(sessionId);
+  if(!sess?.zalo){ res.json({ok:false,error:'Chưa đăng nhập Zalo'}); return; }
+  try{
+    await sess.zalo.sendMessage({to,text});
+    // Lưu tin nhắn thủ công
+    const c=getContact(to);
+    c.msgs.push({from:'human',t:text,time:new Date().toLocaleTimeString('vi',{hour:'2-digit',minute:'2-digit'})});
+    broadcast({type:'human_reply',platform:'zalo',to,content:text,timestamp:Date.now()});
+    res.json({ok:true});
+  }catch(e){ res.json({ok:false,error:e.message}); }
+});
+
+// ── API: Cập nhật Gemini key từ frontend ─────────────────────
+app.post('/api/set-gemini-key',(req,res)=>{
+  const{key}=req.body||{};
+  if(key&&key.length>10){
+    RUNTIME_KEY=key;
+    console.log('[LP] ✅ Gemini key updated from frontend');
+    res.json({ok:true,message:'Gemini key đã được cập nhật'});
+  } else {
+    res.json({ok:false,error:'Key không hợp lệ'});
   }
+});
 
-  // Fallback: greeting
-  return config.greeting || null;
-}
-
-// ── Health check ───────────────────────────────────────────────
-app.get('/health', (req, res) => {
+// ── API: Status tổng hợp ─────────────────────────────────────
+app.get('/health',(req,res)=>{
   res.json({
-    status: 'ok',
-    bots: Object.keys(bots).length,
-    sessions: Object.keys(sessions).length,
-    uptime: Math.round(process.uptime()) + 's'
+    status:'ok', version:'v4',
+    uptime: Math.floor(process.uptime())+'s',
+    ws_clients: wsClients.size,
+    sessions: sessions.size,
+    contacts: contacts.size,
+    ai_ready: !!RUNTIME_KEY,
+    zca_ready: !!ZaloClass,
+    time: new Date().toISOString()
   });
 });
 
-// ── Start server ───────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`
-╔═══════════════════════════════════════════╗
-║  🤖 Zalo Backend — AI Platform Long Phúc A ║
-║  Port: ${PORT}                                ║
-║  WebSocket: ws://localhost:${PORT}           ║
-╚═══════════════════════════════════════════╝
-  `);
+app.get('/',(req,res)=>res.send('LPA Backend v4 ✅'));
+
+// ── START ─────────────────────────────────────────────────────
+server.listen(PORT,()=>{
+  console.log(`\n🚀 LPA Backend v4 — port ${PORT}`);
+  console.log(`   Gemini AI: ${RUNTIME_KEY?'✅ Ready':'⚠️  Chưa có key (nhập từ frontend)'}`);
+  console.log(`   ZCA-JS:    loading...`);
+  console.log(`   WS:        ws://localhost:${PORT}?sid=YOUR_SID`);
+  console.log(`   Health:    http://localhost:${PORT}/health\n`);
 });
